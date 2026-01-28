@@ -1,7 +1,9 @@
 import type { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
+import type { ServerDefinition } from '../config.js';
 import type { Logger } from '../logging.js';
 import type { OAuthSession } from '../oauth.js';
+import { readCachedAccessToken } from '../oauth-persistence.js';
 import { isUnauthorizedError } from '../runtime-oauth-support.js';
 
 export const DEFAULT_OAUTH_CODE_TIMEOUT_MS = 60_000;
@@ -19,6 +21,21 @@ export class OAuthTimeoutError extends Error {
   }
 }
 
+/**
+ * Error thrown when OAuth tokens were saved successfully but the transport connection
+ * failed afterward. This signals to the caller that auth succeeded and a retry with
+ * a fresh transport should work.
+ */
+export class OAuthSuccessRetryNeeded extends Error {
+  public readonly serverName: string;
+
+  constructor(serverName: string) {
+    super(`OAuth completed for '${serverName}' but transport failed. Retry with fresh connection.`);
+    this.name = 'OAuthSuccessRetryNeeded';
+    this.serverName = serverName;
+  }
+}
+
 export async function connectWithAuth(
   client: Client,
   transport: Transport & {
@@ -27,15 +44,29 @@ export async function connectWithAuth(
   },
   session: OAuthSession | undefined,
   logger: Logger,
-  options: { serverName?: string; maxAttempts?: number; oauthTimeoutMs?: number } = {}
+  options: {
+    serverName?: string;
+    maxAttempts?: number;
+    oauthTimeoutMs?: number;
+    definition?: ServerDefinition;
+  } = {}
 ): Promise<void> {
-  const { serverName, maxAttempts = 3, oauthTimeoutMs = DEFAULT_OAUTH_CODE_TIMEOUT_MS } = options;
+  const { serverName, maxAttempts = 3, oauthTimeoutMs = DEFAULT_OAUTH_CODE_TIMEOUT_MS, definition } = options;
   let attempt = 0;
+  let oauthAttempted = false;
   while (true) {
     try {
       await client.connect(transport);
       return;
     } catch (error) {
+      // Check if tokens were saved despite transport error (OAuth succeeded but connection failed)
+      if (!isUnauthorizedError(error) && oauthAttempted && definition) {
+        const savedToken = await readCachedAccessToken(definition, logger).catch(() => undefined);
+        if (savedToken) {
+          logger.warn('OAuth tokens saved successfully. Retrying with fresh connection...');
+          throw new OAuthSuccessRetryNeeded(serverName ?? 'unknown');
+        }
+      }
       if (!isUnauthorizedError(error) || !session) {
         throw error;
       }
@@ -43,6 +74,7 @@ export async function connectWithAuth(
       if (attempt > maxAttempts) {
         throw error;
       }
+      oauthAttempted = true;
       logger.warn(`OAuth authorization required for '${serverName ?? 'unknown'}'. Waiting for browser approval...`);
       try {
         const code = await waitForAuthorizationCodeWithTimeout(
@@ -59,6 +91,14 @@ export async function connectWithAuth(
           throw error;
         }
       } catch (authError) {
+        // Check if tokens were saved despite finishAuth error
+        if (definition && !(authError instanceof OAuthTimeoutError)) {
+          const savedToken = await readCachedAccessToken(definition, logger).catch(() => undefined);
+          if (savedToken) {
+            logger.info('OAuth tokens saved successfully. Transport needs fresh connection.');
+            throw new OAuthSuccessRetryNeeded(serverName ?? 'unknown');
+          }
+        }
         logger.error('OAuth authorization failed while waiting for callback.', authError);
         throw authError;
       }

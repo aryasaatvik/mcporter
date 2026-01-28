@@ -11,7 +11,7 @@ import { readCachedAccessToken } from '../oauth-persistence.js';
 import { materializeHeaders } from '../runtime-header-utils.js';
 import { isUnauthorizedError, maybeEnableOAuth } from '../runtime-oauth-support.js';
 import { closeTransportAndWait } from '../runtime-process-utils.js';
-import { connectWithAuth, OAuthTimeoutError } from './oauth.js';
+import { connectWithAuth, OAuthSuccessRetryNeeded, OAuthTimeoutError } from './oauth.js';
 import { resolveCommandArgument, resolveCommandArguments } from './utils.js';
 
 const STDIO_TRACE_ENABLED = process.env.MCPORTER_STDIO_TRACE === '1';
@@ -131,6 +131,7 @@ export async function createClientContext(
             serverName: activeDefinition.name,
             maxAttempts: options.maxOAuthAttempts,
             oauthTimeoutMs: options.oauthTimeoutMs,
+            definition: activeDefinition,
           });
           return {
             client,
@@ -147,6 +148,13 @@ export async function createClientContext(
       try {
         return await attemptConnect();
       } catch (primaryError) {
+        // OAuth succeeded but transport failed - retry with fresh connection
+        if (primaryError instanceof OAuthSuccessRetryNeeded) {
+          await oauthSession?.close().catch(() => {});
+          oauthSession = undefined;
+          logger.info(`Retrying connection for '${activeDefinition.name}' with saved OAuth tokens...`);
+          continue;
+        }
         if (isUnauthorizedError(primaryError)) {
           await oauthSession?.close().catch(() => {});
           oauthSession = undefined;
@@ -174,11 +182,16 @@ export async function createClientContext(
             serverName: activeDefinition.name,
             maxAttempts: options.maxOAuthAttempts,
             oauthTimeoutMs: options.oauthTimeoutMs,
+            definition: activeDefinition,
           });
           return { client, transport: sseTransport, definition: activeDefinition, oauthSession };
         } catch (sseError) {
           await closeTransportAndWait(logger, sseTransport).catch(() => {});
           await oauthSession?.close().catch(() => {});
+          if (sseError instanceof OAuthSuccessRetryNeeded) {
+            logger.info(`Retrying connection for '${activeDefinition.name}' with saved OAuth tokens...`);
+            continue;
+          }
           if (sseError instanceof OAuthTimeoutError) {
             throw sseError;
           }
